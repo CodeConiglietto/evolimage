@@ -1,0 +1,18 @@
+[package]
+name = "evolimage"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+protoplasm = { git = "https://github.com/CodeConiglietto/protoplasm.git", branch = "master" }
+bunnyfont = { git = "https://github.com/CodeConiglietto/bunnyfont.git", branch = "master", features = ["image-integration"] }
+
+ggez = "0.7.0"
+image = "0.24.2"
+ndarray = { version = "0.15.4", features = ["rayon"] }
+palette = "0.5.0"
+rand = "0.8.5"
+rayon = "1.5.1"
+structopt = "0.3.26"
