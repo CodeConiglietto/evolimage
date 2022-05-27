@@ -16,3 +16,7 @@ palette = "0.5.0"
 rand = "0.8.5"
 rayon = "1.5.1"
 structopt = "0.3.26"
+float-ord = "0.3.2"
+tui = { version = "0.18.0", default-features = false, features = ["termion"] }
+termion = "1.5.6"
+itertools = "0.10.3"
