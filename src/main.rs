@@ -1,6 +1,3 @@
-use tui::text::Span;
-use tui::layout::Constraint;
-use tui::layout::Layout;
 use ggez::input::keyboard::KeyMods;
 use std::collections::VecDeque;
 use std::env;
@@ -9,13 +6,16 @@ use std::io;
 use std::io::Stdout;
 use std::path::PathBuf;
 use termion::raw::RawTerminal;
+use tui::layout::Constraint;
+use tui::layout::Direction;
+use tui::layout::Layout;
 use tui::style::Style;
+use tui::text::Span;
 use tui::widgets::Axis;
 use tui::widgets::Block;
+use tui::widgets::Borders;
 use tui::widgets::Chart;
 use tui::widgets::Dataset;
-use tui::layout::{Direction};
-use tui::widgets::Borders;
 
 use tui::{symbols::Marker, widgets::GraphType, Terminal};
 
@@ -83,10 +83,10 @@ fn main() {
 
     // Make a Context.
     let (mut ctx, event_loop) = ContextBuilder::new("my_game", "Cool Game Author")
-        .window_mode(
-            WindowMode::default()
-                .dimensions(source_image.width() as f32 * 2.0, source_image.height() as f32 * 2.0),
-        )
+        .window_mode(WindowMode::default().dimensions(
+            source_image.width() as f32 * 2.0,
+            source_image.height() as f32 * 2.0,
+        ))
         .build()
         .expect("aieee, could not create ggez context!");
 
@@ -99,16 +99,70 @@ fn main() {
     event::run(ctx, event_loop, my_game);
 }
 
+struct ScoreAggregate {
+    total: usize,
+    sum: f32,
+    min: Option<f32>,
+    max: Option<f32>,
+}
+
+impl ScoreAggregate {
+    fn empty() -> ScoreAggregate {
+        ScoreAggregate {
+            total: 0,
+            sum: 0.0,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn new(frame_score: f32) -> ScoreAggregate {
+        ScoreAggregate {
+            total: 1,
+            sum: frame_score,
+            min: Some(frame_score),
+            max: Some(frame_score),
+        }
+    }
+
+    fn combine(&self, other: &ScoreAggregate) -> ScoreAggregate {
+        let min = match (self.min, other.min) {
+            (Some(min), Some(other_min)) => Some(min.min(other_min)),
+            (Some(_), None) => self.min,
+            (None, Some(_)) => other.min,
+            (None, None) => None,
+        };
+
+        let max = match (self.max, other.max) {
+            (Some(max), Some(other_max)) => Some(max.max(other_max)),
+            (Some(_), None) => self.max,
+            (None, Some(_)) => other.max,
+            (None, None) => None,
+        };
+
+        ScoreAggregate {
+            total: self.total + other.total,
+            sum: self.sum + other.sum,
+            min,
+            max,
+        }
+    }
+
+    fn get_average(&self) -> f32 {
+        self.sum / self.total as f32
+    }
+}
+
 struct MyGame {
     font: ImageBunnyFont,
     source_image: RgbaImage,
-    char_buffer: Array2<ImageBunnyChar>,
+    char_buffer: Array2<(ImageBunnyChar, f32)>,
     processed_char_image: RgbaImage,
     display_frame: ggez::graphics::Image,
     terminal: Terminal<TermionBackend<RawTerminal<Stdout>>>,
     current_tic: usize,
     target_scores: VecDeque<(usize, f32)>,
-    scores: VecDeque<(usize, f32)>,
+    scores: VecDeque<(usize, ScoreAggregate)>,
     deltas: VecDeque<(usize, f32)>,
 }
 
@@ -131,8 +185,16 @@ impl MyGame {
         let char_buf_width = source_image.width() as usize / char_width;
         let char_buf_height = source_image.height() as usize / char_height;
 
-        let char_buffer = Array2::from_shape_fn((char_buf_width, char_buf_height), |(_, _)| {
-            gen_random_char(&font)
+        let char_buffer = Array2::from_shape_fn((char_buf_width, char_buf_height), |(x, y)| {
+            let bunny_char = gen_random_char(&font);
+            let score = char_score(
+                &font,
+                &bunny_char,
+                &source_image,
+                (x * char_width) as u32,
+                (y * char_height) as u32,
+            );
+            (bunny_char, score)
         });
 
         let processed_char_image = process_char_image(&char_buffer, &font);
@@ -149,7 +211,7 @@ impl MyGame {
         target_scores.push_front((0, 0.0));
 
         let mut scores = VecDeque::new();
-        scores.push_front((0, 0.0));
+        scores.push_front((0, ScoreAggregate::empty()));
 
         let mut deltas = VecDeque::new();
         deltas.push_front((0, 0.0));
@@ -195,26 +257,25 @@ impl EventHandler for MyGame {
 
         let (buffer_width, buffer_height) = self.char_buffer.dim();
 
-        let total_chars = buffer_width * buffer_height;
-
         let mut target_score = self.target_scores[0].1;
 
-        let frame_score = Zip::indexed(&mut self.char_buffer).par_fold(
-            || 0.0,
-            |sum, (x, y), current_char| {
+        let last_aggregate = &self.scores[0].1;
+
+        let aggregate_frame_score = Zip::indexed(&mut self.char_buffer).par_fold(
+            || ScoreAggregate::empty(),
+            |aggregate, (x, y), (current_char, current_score)| {
                 let pixel_x = x as u32 * char_width as u32;
                 let pixel_y = y as u32 * char_height as u32;
 
-                let current_score = char_score(
-                    &self.font,
-                    &current_char,
-                    comparison_image,
-                    pixel_x,
-                    pixel_y,
-                );
+                if *current_score < target_score {
+                    let char_amount = (10.0
+                        * (1.0
+                            - ((*current_score - last_aggregate.min.unwrap_or(0.0))
+                                / (last_aggregate.max.unwrap_or(1.0)
+                                    - last_aggregate.min.unwrap_or(0.0))))
+                        .powf(1.0)) as usize;
 
-                if current_score < target_score {
-                    let potential_chars: Vec<(ImageBunnyChar, f32)> = (0..4)
+                    let mut potential_chars: Vec<(ImageBunnyChar, f32)> = (0..char_amount)
                         .map(|_| {
                             let mutated_char = mutated_char(&current_char, &self.font);
                             let char_score = char_score(
@@ -229,39 +290,52 @@ impl EventHandler for MyGame {
                         })
                         .collect();
 
+                    //Provide a fully random char as well, in case we need to be shaken out of a local max
+                    let generated_char = gen_random_char(&self.font);
+                    let generate_char_score = char_score(
+                        &self.font,
+                        &generated_char,
+                        comparison_image,
+                        pixel_x,
+                        pixel_y,
+                    );
+                    potential_chars.push((generated_char, generate_char_score));
+
                     let (best_potential_char, best_potential_score) = potential_chars
                         .iter()
                         .max_by_key(|(_, score)| FloatOrd(*score))
                         .unwrap();
 
-                    if *best_potential_score > current_score {
+                    if *best_potential_score > *current_score {
                         *current_char = *best_potential_char;
-                        sum + best_potential_score
+                        *current_score = *best_potential_score;
+                        aggregate.combine(&ScoreAggregate::new(*best_potential_score))
                     } else {
-                        sum + current_score
+                        aggregate.combine(&ScoreAggregate::new(*current_score))
                     }
                 } else {
-                    sum + current_score
+                    aggregate.combine(&ScoreAggregate::new(*current_score))
                 }
             },
-            |a, b| a + b,
-        ) / total_chars as f32;
+            |a, b| a.combine(&b),
+        );
 
         self.processed_char_image = process_char_image(&self.char_buffer, &self.font);
         self.display_frame = process_display_frame(ctx, &self.processed_char_image);
 
-        let frame_score_delta = frame_score - self.scores[0].1;
+        let frame_score_delta =
+            aggregate_frame_score.get_average() - self.scores[0].1.get_average();
 
         // print!("\rCurrent frame score is: {:.10}, score delta is: {:.10}", frame_score, frame_score_delta);
 
-        if frame_score > target_score {
-            target_score = target_score + (1.0 - target_score) * 0.01;
+        if aggregate_frame_score.get_average() > target_score {
+            target_score = target_score + (1.0 - target_score) * 0.5;
         }
 
         self.target_scores
             .push_front((self.current_tic, target_score));
         self.scores
-            .push_front((self.current_tic, frame_score));
+            .push_front((self.current_tic, aggregate_frame_score));
         self.deltas
             .push_front((self.current_tic, frame_score_delta));
 
@@ -281,12 +355,22 @@ impl EventHandler for MyGame {
             .minmax_by_key(|(_, score)| FloatOrd(*score))
             .into_option()
             .unwrap();
-        let score_range = self
-            .scores
-            .iter()
-            .minmax_by_key(|(_, score)| FloatOrd(*score))
-            .into_option()
-            .unwrap();
+        let (score_range_min, score_range_max) = (
+            self.scores
+                .iter()
+                .min_by_key(|(_, score)| FloatOrd(score.min.unwrap_or(0.0)))
+                .unwrap_or(&(0, ScoreAggregate::empty()))
+                .1
+                .min
+                .unwrap_or(0.0),
+            self.scores
+                .iter()
+                .max_by_key(|(_, score)| FloatOrd(score.max.unwrap_or(0.0)))
+                .unwrap_or(&(0, ScoreAggregate::empty()))
+                .1
+                .max
+                .unwrap_or(0.0),
+        );
         let delta_range = self
             .deltas
             .iter()
@@ -307,17 +391,41 @@ impl EventHandler for MyGame {
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(tui::style::Color::Green))
                     .data(&raw_target_scores);
-                let raw_scores = self
+
+                let raw_average_scores = self
                     .scores
                     .iter()
-                    .map(|(tic, score)| (*tic as f64, *score as f64))
+                    .map(|(tic, score)| (*tic as f64, score.get_average() as f64))
                     .collect::<Vec<_>>();
-                let scores = Dataset::default()
-                    .name("Score")
+                let average_scores = Dataset::default()
+                    .name("Mean")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(tui::style::Color::Magenta))
+                    .data(&raw_average_scores);
+                let raw_min_scores = self
+                    .scores
+                    .iter()
+                    .map(|(tic, score)| (*tic as f64, score.min.unwrap_or(0.0) as f64))
+                    .collect::<Vec<_>>();
+                let min_scores = Dataset::default()
+                    .name("Min")
                     .marker(Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(tui::style::Color::Red))
-                    .data(&raw_scores);
+                    .data(&raw_min_scores);
+                let raw_max_scores = self
+                    .scores
+                    .iter()
+                    .map(|(tic, score)| (*tic as f64, score.max.unwrap_or(0.0) as f64))
+                    .collect::<Vec<_>>();
+                let max_scores = Dataset::default()
+                    .name("Max")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(tui::style::Color::Yellow))
+                    .data(&raw_max_scores);
+
                 let raw_deltas = self
                     .deltas
                     .iter()
@@ -330,31 +438,49 @@ impl EventHandler for MyGame {
                     .style(Style::default().fg(tui::style::Color::Blue))
                     .data(&raw_deltas);
 
-                    let unified_score_range = (score_range.0.1.min(target_score_range.0.1) as f64, score_range.1.1.max(target_score_range.1.1) as f64);
+                let unified_score_range = (
+                    score_range_min.min(target_score_range.0 .1) as f64,
+                    score_range_max.max(target_score_range.1 .1) as f64,
+                );
 
-                    let score_chart = Chart::new(vec![target_scores, scores])
+                let score_chart =
+                    Chart::new(vec![target_scores, average_scores, min_scores, max_scores])
                         .block(Block::default().title("Score").borders(Borders::ALL))
                         .x_axis(
                             Axis::default()
                                 .bounds([self.current_tic as f64 - 256.0, self.current_tic as f64]),
                         )
                         .y_axis(
-                            Axis::default().bounds([unified_score_range.0 as f64, unified_score_range.1 as f64])
-                                .labels(vec!(Span::from(format!("{:.10}", unified_score_range.0)), Span::from(format!("{:.10}", unified_score_range.1)))),
-                        );
-
-                    let delta_chart = Chart::new(vec![deltas])
-                        .block(Block::default().title("Delta").borders(Borders::ALL))
-                        .x_axis(
                             Axis::default()
-                                .bounds([self.current_tic as f64 - 256.0, self.current_tic as f64]),
-                        )
-                        .y_axis(
-                            Axis::default().bounds([delta_range.0.1 as f64, delta_range.1.1 as f64])
-                                .labels(vec!(Span::from(format!("{:.10}", delta_range.0.1)), Span::from(format!("{:.10}", delta_range.1.1)))),
+                                .bounds([
+                                    unified_score_range.0 as f64,
+                                    unified_score_range.1 as f64,
+                                ])
+                                .labels(vec![
+                                    Span::from(format!("{:.10}", unified_score_range.0)),
+                                    Span::from(format!("{:.10}", unified_score_range.1)),
+                                ]),
                         );
 
-                let layout = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Ratio(1, 2); 2]).split(frame.size());
+                let delta_chart = Chart::new(vec![deltas])
+                    .block(Block::default().title("Delta").borders(Borders::ALL))
+                    .x_axis(
+                        Axis::default()
+                            .bounds([self.current_tic as f64 - 256.0, self.current_tic as f64]),
+                    )
+                    .y_axis(
+                        Axis::default()
+                            .bounds([delta_range.0 .1 as f64, delta_range.1 .1 as f64])
+                            .labels(vec![
+                                Span::from(format!("{:.10}", delta_range.0 .1)),
+                                Span::from(format!("{:.10}", delta_range.1 .1)),
+                            ]),
+                    );
+
+                let layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Ratio(1, 2); 2])
+                    .split(frame.size());
 
                 frame.render_widget(score_chart, layout[0]);
                 frame.render_widget(delta_chart, layout[1]);
@@ -414,7 +540,10 @@ fn char_score(
     total_score / total_pixels as f32
 }
 
-fn process_char_image(char_buffer: &Array2<ImageBunnyChar>, font: &ImageBunnyFont) -> RgbaImage {
+fn process_char_image(
+    char_buffer: &Array2<(ImageBunnyChar, f32)>,
+    font: &ImageBunnyFont,
+) -> RgbaImage {
     let (buffer_width, buffer_height) = char_buffer.dim();
 
     let (char_width, char_height) = font.char_dimensions();
@@ -427,7 +556,7 @@ fn process_char_image(char_buffer: &Array2<ImageBunnyChar>, font: &ImageBunnyFon
 
             let (buffer_x, buffer_y) = (x as usize / char_width, y as usize / char_height);
 
-            let bunny_char = char_buffer[[buffer_x, buffer_y]];
+            let (bunny_char, _) = char_buffer[[buffer_x, buffer_y]];
 
             font.char_pixel(&bunny_char, char_pix_x, char_pix_y)
         },
@@ -469,39 +598,52 @@ fn gen_random_char(font: &ImageBunnyFont) -> ImageBunnyChar {
 }
 
 fn mutated_char(original_char: &ImageBunnyChar, font: &ImageBunnyFont) -> ImageBunnyChar {
-    let new_char = original_char.clone();
+    let mut new_char = original_char.clone();
 
-    match thread_rng().gen_range(0..=7) {
-        0 => new_char.index(thread_rng().gen_range(0..(font.total_char_indices() - 80))), //TODO: remove workaround and introduce functionality to bunnyfont instead
+    for _ in 0..thread_rng().gen_range(1..10) {
+        new_char = match thread_rng().gen_range(0..=9) {
+            0 => new_char.index(thread_rng().gen_range(0..(font.total_char_indices() - 80))), //TODO: remove workaround and introduce functionality to bunnyfont instead
+            1 => new_char.index(
+                (new_char.index + (thread_rng().gen::<u8>() as f32).sqrt() as usize)
+                    % (font.total_char_indices() - 80),
+            ),
+            2 => new_char.index(
+                new_char
+                    .index
+                    .saturating_sub((thread_rng().gen::<u8>() as f32).sqrt() as usize),
+            ),
 
-        1 => new_char.foreground(mutated_color(&new_char.foreground)),
-        2 => new_char.foreground(
-            [
-                random::<u8>(),
-                random::<u8>(),
-                random::<u8>(),
-                random::<u8>(),
-            ]
-            .into(),
-        ),
+            3 => new_char.foreground(mutated_color(&new_char.foreground)),
+            4 => new_char.foreground(
+                [
+                    random::<u8>(),
+                    random::<u8>(),
+                    random::<u8>(),
+                    random::<u8>(),
+                ]
+                .into(),
+            ),
 
-        3 => new_char.background(Some(mutated_color(&new_char.background.unwrap()))),
-        4 => new_char.background(Some(
-            [
-                random::<u8>(),
-                random::<u8>(),
-                random::<u8>(),
-                random::<u8>(),
-            ]
-            .into(),
-        )),
+            5 => new_char.background(Some(mutated_color(&new_char.background.unwrap()))),
+            6 => new_char.background(Some(
+                [
+                    random::<u8>(),
+                    random::<u8>(),
+                    random::<u8>(),
+                    random::<u8>(),
+                ]
+                .into(),
+            )),
 
-        5 => new_char.rotation(random_rotation()),
-        6 => new_char.mirror(random_mirror()),
+            7 => new_char.rotation(random_rotation()),
+            8 => new_char.mirror(random_mirror()),
 
-        7 => gen_random_char(&font),
-        _ => panic!(),
+            9 => gen_random_char(&font),
+            _ => panic!(),
+        }
     }
+
+    new_char
 }
 
 fn mutated_color(original_color: &Rgba<u8>) -> Rgba<u8> {
@@ -511,9 +653,11 @@ fn mutated_color(original_color: &Rgba<u8>) -> Rgba<u8> {
 
     if thread_rng().gen_bool(0.5) {
         if thread_rng().gen_bool(0.5) {
-            new_color.channels_mut()[channel] = new_color.channels_mut()[channel].saturating_add(1);
+            new_color.channels_mut()[channel] = new_color.channels_mut()[channel]
+                .saturating_add((thread_rng().gen::<u8>() as f32).sqrt() as u8);
         } else {
-            new_color.channels_mut()[channel] = new_color.channels_mut()[channel].saturating_sub(1);
+            new_color.channels_mut()[channel] = new_color.channels_mut()[channel]
+                .saturating_sub((thread_rng().gen::<u8>() as f32).sqrt() as u8);
         }
     } else {
         new_color.channels_mut()[channel] = random::<u8>();
